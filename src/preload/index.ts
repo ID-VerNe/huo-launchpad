@@ -12,22 +12,25 @@ const api = {
   selectFile: () => ipcRenderer.invoke('select-file'),
   processPaths: (paths: string[]) => ipcRenderer.invoke('process-paths', paths),
   onWindowShown: (callback: any) => {
-    const subscription = (_event: any) => callback()
-    ipcRenderer.on('window-shown', subscription)
-    return () => ipcRenderer.removeListener('window-shown', subscription)
+    const sub = () => callback()
+    ipcRenderer.on('window-shown', sub)
+    return () => ipcRenderer.removeListener('window-shown', sub)
+  },
+  // --- 性能优化: 监听图标更新推送 ---
+  onIconUpdate: (callback: (data: { path: string, icon: string }) => void) => {
+    const sub = (_: any, data: any) => callback(data)
+    ipcRenderer.on('icon-update', sub)
+    return () => ipcRenderer.removeListener('icon-update', sub)
   },
   getHotkey: () => ipcRenderer.invoke('get-hotkey'),
   setHotkey: (h: string) => ipcRenderer.invoke('set-hotkey', h)
 }
 
-// 审计建议 #8: 更严谨的上下文隔离检查
 if (typeof contextBridge !== 'undefined' && contextBridge.exposeInMainWorld) {
   try {
     contextBridge.exposeInMainWorld('electron', electronAPI)
     contextBridge.exposeInMainWorld('api', api)
-  } catch (error) {
-    console.error('[PRELOAD] ContextBridge 暴露失败:', error)
-  }
+  } catch (error) { console.error(error) }
 } else {
   // @ts-ignore
   window.electron = electronAPI

@@ -37,20 +37,26 @@ export default function App() {
   }, [])
 
   const loadPinned = useCallback(() => {
-    // 审计建议 #15: 完善错误捕获
-    window.api?.getPinnedApps()
-      .then(apps => setState(s => ({ ...s, pinnedApps: apps || [] })))
-      .catch(err => {
-        console.error('[UI] 加载失败:', err)
-        setState(s => ({ ...s, pinnedApps: [] }))
-      })
+    window.api?.getPinnedApps().then(apps => setState(s => ({ ...s, pinnedApps: apps || [] }))).catch(() => {})
   }, [])
 
   useEffect(() => { 
     loadPinned()
     window.api?.getHotkey().then(h => setState(s => ({ ...s, hotkey: h || 'Alt+Q' }))).catch(() => {})
+
+    // --- 性能优化: 监听增量图标推送 ---
+    const removeIconListener = window.api?.onIconUpdate((update: { path: string, icon: string }) => {
+      setState(s => ({
+        ...s,
+        results: s.results.map(item => item.path === update.path ? { ...item, icon: update.icon } : item),
+        pinnedApps: s.pinnedApps.map(item => item.path === update.path ? { ...item, icon: update.icon } : item)
+      }))
+    })
+
+    return () => { if (removeIconListener) removeIconListener() }
   }, [loadPinned])
 
+  // --- 性能优化: 动态 Debounce 提速 ---
   useEffect(() => {
     const delay = setTimeout(async () => {
       const q = state.query.trim()
@@ -61,21 +67,19 @@ export default function App() {
           setState(s => ({ ...s, results: data || [], loading: false, selectedIndex: 0 }))
         } catch (e) { setState(s => ({ ...s, loading: false })) }
       } else { setState(s => ({ ...s, results: [], selectedIndex: 0 })) }
-    }, 150)
+    }, state.query.length < 2 ? 250 : 100) // 长词搜索更快
     return () => clearTimeout(delay)
   }, [state.query])
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     const { isRecording, showSettings, query, pinnedApps, results, selectedIndex } = stateRef.current
     if (isRecording) {
-      e.preventDefault()
-      const keys: string[] = []
+      e.preventDefault(); const keys: string[] = []
       if (e.ctrlKey) keys.push('Ctrl'); if (e.shiftKey) keys.push('Shift')
       if (e.altKey) keys.push('Alt'); if (e.metaKey) keys.push('Cmd')
       const key = e.key.toUpperCase()
       if (!['CONTROL', 'SHIFT', 'ALT', 'META'].includes(key)) {
-        keys.push(key === ' ' ? 'Space' : key)
-        const h = keys.join('+')
+        keys.push(key === ' ' ? 'Space' : key); const h = keys.join('+')
         window.api.setHotkey(h).then(res => {
           if (res.success) setState(s => ({ ...s, hotkey: h, isRecording: false }))
           else { alert(res.message); setState(s => ({ ...s, isRecording: false })) }
@@ -105,29 +109,21 @@ export default function App() {
 
   const handleLaunch = (path: string) => window.api.launch(path)
   
-  // 审计建议 #15: 增加校验与 try-catch
   const handlePin = async (e: any, item: any) => { 
-    e.stopPropagation()
-    const index = findFirstEmpty(state.pinnedApps)
+    e.stopPropagation(); const index = findFirstEmpty(state.pinnedApps)
     try {
       const newPinned = await window.api.pinApp(item, index)
       if (newPinned) setState(s => ({ ...s, pinnedApps: newPinned, query: '' }))
-    } catch (err) { console.error('[UI] 固定失败:', err) }
+    } catch (err) {}
   }
 
   const handleUnpin = async (e: any, path: string) => { 
     e.stopPropagation()
-    try {
-      const res = await window.api.unpinApp(path)
-      if (res) setState(s => ({ ...s, pinnedApps: res }))
-    } catch (e) {}
+    try { const res = await window.api.unpinApp(path); if (res) setState(s => ({ ...s, pinnedApps: res })) } catch (e) {}
   }
 
   const handleReorder = async (path: string, newIndex: number) => {
-    try {
-      const res = await window.api.updateAppPosition(path, newIndex)
-      if (res) setState(s => ({ ...s, pinnedApps: res }))
-    } catch (e) {}
+    try { const res = await window.api.updateAppPosition(path, newIndex); if (res) setState(s => ({ ...s, pinnedApps: res })) } catch (e) {}
   }
 
   const handleAddFile = async () => { 
@@ -150,8 +146,7 @@ export default function App() {
         const newItems = await window.api.processPaths(paths)
         let current = [...stateRef.current.pinnedApps]
         for (const item of newItems) {
-          const idx = findFirstEmpty(current)
-          const updated = await window.api.pinApp(item, idx)
+          const idx = findFirstEmpty(current); const updated = await window.api.pinApp(item, idx)
           if (updated) current = updated
         }
         setState(s => ({ ...s, pinnedApps: current }))
@@ -201,7 +196,7 @@ export default function App() {
                 <span>{state.isRecording ? '请按组合键...' : '修改唤起热键'}</span>
               </button>
               <div className="px-4 py-2 text-[10px] text-slate-400 font-bold uppercase tracking-wider bg-slate-50 flex justify-between">
-                <span>Huo-Launchpad v3.7</span><span className="text-sky-500">{state.hotkey}</span>
+                <span>Huo-Launchpad v3.8</span><span className="text-sky-500">{state.hotkey}</span>
               </div>
             </div>
           )}
