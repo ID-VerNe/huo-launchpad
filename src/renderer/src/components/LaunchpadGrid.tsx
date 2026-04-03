@@ -4,11 +4,10 @@ import { twMerge } from 'tailwind-merge'
 import { useSortable, SortableContext, rectSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, DragOverlay, defaultDropAnimationSideEffects } from '@dnd-kit/core'
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 
 function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)) }
 
-// --- 纯净图标组件 (用于复用) ---
 function AppIcon({ item, isPlaceholder, isOverlay }: any) {
   if (!item) return null
   return (
@@ -27,7 +26,6 @@ function AppIcon({ item, isPlaceholder, isOverlay }: any) {
   )
 }
 
-// --- 槽位组件 ---
 function GridSlot({ item, index, selectedIndex, onLaunch, onUnpin }: any) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ 
     id: item ? item.path : `empty-${index}`,
@@ -36,7 +34,7 @@ function GridSlot({ item, index, selectedIndex, onLaunch, onUnpin }: any) {
 
   const style = {
     transform: CSS.Translate.toString(transform),
-    transition: isDragging ? 'none' : transition, // 关键：拖拽时禁用过渡
+    transition: isDragging ? 'none' : transition,
   }
 
   return (
@@ -72,64 +70,45 @@ function GridSlot({ item, index, selectedIndex, onLaunch, onUnpin }: any) {
 
 export default function LaunchpadGrid({ pinnedApps, selectedIndex, onLaunch, onUnpin, onReorder }: any) {
   const [activeItem, setActiveItem] = useState<any>(null)
-  
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }) // 更敏感的指针传感器
-  )
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
 
-  const grid = Array.from({ length: 50 }, (_, i) => {
-    return pinnedApps.find((a: any) => a.grid_index === i) || null
-  })
+  // 审计建议 #21: 使用 Map 优化 O(n) 查找
+  const grid = useMemo(() => {
+    const pinnedMap = new Map(pinnedApps.map((a: any) => [a.grid_index, a]))
+    return Array.from({ length: 50 }, (_, i) => pinnedMap.get(i) || null)
+  }, [pinnedApps])
 
   const handleDragStart = (event: any) => {
     const item = pinnedApps.find((a: any) => a.path === event.active.id)
-    setActiveItem(item)
+    if (item) setActiveItem(item)
   }
 
   const handleDragEnd = (event: any) => {
     const { active, over } = event
     setActiveItem(null)
     if (over && active.id !== over.id) {
-      const newIndex = parseInt(over.id.startsWith('empty-') ? over.id.split('-')[1] : grid.findIndex(g => g?.path === over.id))
-      if (!isNaN(newIndex)) {
+      const targetId = String(over.id)
+      const newIndex = targetId.startsWith('empty-') 
+        ? parseInt(targetId.split('-')[1]) 
+        : grid.findIndex(g => g?.path === targetId)
+      
+      if (!isNaN(newIndex) && newIndex !== -1) {
         onReorder(active.id, newIndex)
       }
     }
   }
 
   return (
-    <DndContext 
-      sensors={sensors} 
-      collisionDetection={closestCenter} 
-      onDragStart={handleDragStart} 
-      onDragEnd={handleDragEnd}
-    >
+    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
       <SortableContext items={grid.map((item, i) => item ? item.path : `empty-${i}`)} strategy={rectSortingStrategy}>
         <div className="grid grid-cols-10 gap-y-4 gap-x-2">
           {grid.map((item, index) => (
-            <GridSlot 
-              key={item ? item.path : `empty-${index}`} 
-              item={item} 
-              index={index} 
-              selectedIndex={selectedIndex} 
-              onLaunch={onLaunch} 
-              onUnpin={onUnpin} 
-            />
+            <GridSlot key={item ? item.path : `empty-${index}`} item={item} index={index} selectedIndex={selectedIndex} onLaunch={onLaunch} onUnpin={onUnpin} />
           ))}
         </div>
       </SortableContext>
-
-      {/* 核心性能优化：拖拽浮层 */}
-      <DragOverlay dropAnimation={{
-        sideEffects: defaultDropAnimationSideEffects({
-          styles: { active: { opacity: '0.5' } }
-        })
-      }}>
-        {activeItem ? (
-          <div className="w-[90px]"> {/* 固定宽度防止浮层抖动 */}
-            <AppIcon item={activeItem} isOverlay />
-          </div>
-        ) : null}
+      <DragOverlay dropAnimation={{ sideEffects: defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } }) }}>
+        {activeItem ? <div className="w-[90px]"><AppIcon item={activeItem} isOverlay /></div> : null}
       </DragOverlay>
     </DndContext>
   )
