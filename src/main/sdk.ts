@@ -29,19 +29,18 @@ export interface SearchResult {
 }
 
 export function executeQuery(query: string, maxResults = 50): SearchResult[] {
-  if (!sdk || !sdk.isLoaded()) return []
+  // 审计建议 #16: 增加更严谨的函数指针检查
+  if (!sdk || typeof sdk.isLoaded !== 'function' || !sdk.isLoaded()) return []
   
   try {
-    // 增加输入基础验证 (审计报告 #6)
     const sanitizedQuery = query.slice(0, 200).replace(/[\x00-\x1F\x7F]/g, '')
     
-    sdk.setSearch(sanitizedQuery + ' ext:exe;lnk;url !uninstall !"c:\\windows\\"')
-    sdk.setRequestFlags(0x00000001 | 0x00000002) 
+    if (typeof sdk.setSearch === 'function') sdk.setSearch(sanitizedQuery + ' ext:exe;lnk;url !uninstall !"c:\\windows\\"')
+    if (typeof sdk.setRequestFlags === 'function') sdk.setRequestFlags(0x00000001 | 0x00000002) 
     
-    // bWait=true 时，虽然会阻塞，但我们通过 IPC handle 的异步机制外层保护
-    if (!sdk.query(true)) return []
+    if (typeof sdk.query === 'function' && !sdk.query(true)) return []
 
-    const num = Math.min(sdk.getNumResults(), maxResults)
+    const num = typeof sdk.getNumResults === 'function' ? Math.min(sdk.getNumResults(), maxResults) : 0
     const results: SearchResult[] = []
 
     for (let i = 0; i < num; i++) {
