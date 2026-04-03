@@ -1,74 +1,124 @@
-# 🔍 Huo-Launchpad 代码审计完整报告
+# 代码审计报告 - 逻辑死锁与潜在 Bug
 
-## 项目概况
-
-| 项目 | 信息 |
-|------|------|
-| 项目名称 | Huo-Launchpad (火 Launcher) |
-| 技术栈 | Electron + React + TypeScript + better-sqlite3 + koffi |
-| 审计日期 | 2026-04-03 |
-| 问题总数 | 44 个 |
-| 已修复 | 10 个 |
-| 仍存在 | 34 个 |
+> 审计时间：2026-04-03
+> 项目：HuoLauncher (Electron + React + better-sqlite3 + Everything SDK)
 
 ---
 
-## 🔴 高严重程度问题（7个）- 必须修复
+## 一、严重级别问题（可能导致崩溃或数据丢失）
 
-### ❌ 问题 1：detached 进程无法监控和清理
-**位置**: `src/main/index.ts:38`
+### 1. 【严重】数据库 prepare 语句空指针访问 🔴
 
+**位置**: [db.ts:31-40](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/db.ts#L31-L40)
+
+**问题描述**:
 ```typescript
-everythingProcess = spawn(join(binPath, 'Everything.exe'), ['-config', iniPath, '-minimized'], { detached: true, stdio: 'pipe' })
+export const stmts = {
+  getPinned: db?.prepare('...'),  // 如果 db 初始化失败，stmts.getPinned 是 undefined
+  // ...
+}
+```
+在 [index.ts:11](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L11) 中：
+```typescript
+let currentHotkey = (stmts.getSetting?.get('hotkey') as any)?.value || 'Alt+Q'
+```
+虽然使用了可选链，但后续多处直接调用 `stmts.updateIndex.run()` 而没有检查，如果数据库初始化失败，整个应用会在运行时直接崩溃。
+
+**触发条件**: 数据库文件权限不足或磁盘空间不足导致 better-sqlite3 初始化失败。
+
+**修复建议**:
+```typescript
+// 在 index.ts 启动时添加数据库健康检查
+if (!db || !stmts.getPinned) {
+  dialog.showErrorBox('数据库错误', '应用数据库初始化失败，请重启或重新安装')
+  app.quit()
+}
 ```
 
-**风险**：
-- 子进程独立运行，异常退出时无法感知
-- 多次启动可能产生多个 Everything 实例
-- 无法确保进程被正确终止
+---
 
-**修复建议**：
+### 2. 【严重】updateIndex 死锁与数据竞争 🟠
+
+**位置**: [index.ts:94-103](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L94-L103)
+
+**问题描述**:
 ```typescript
-// 添加进程监控
-everythingProcess.on('error', (err) => {
-  console.error('[ENGINE] 启动失败:', err)
+ipcMain.handle('update-app-position', (_, { path, index }) => {
+  const cur = db.prepare('SELECT grid_index FROM pinned_apps WHERE path = ?').get(path) as any
+  const tgt = db.prepare('SELECT path FROM pinned_apps WHERE grid_index = ?').get(index) as any
+  if (!cur) return stmts.getPinned.all()
+  db.transaction(() => {
+    if (tgt && tgt.path !== path) stmts.updateIndex.run(cur.grid_index, tgt.path)
+    stmts.updateIndex.run(index, path)  // ⚠️ 问题：第二次 run 如果 tgt 不存在，这里会把 cur.app 的 grid_index 也改掉
+  })()
+  return stmts.getPinned.all()
 })
+```
 
-// 退出时清理
-app.on('will-quit', () => {
+**具体问题**:
+1. `stmts.updateIndex.run(index, path)` 没有 WHERE 条件，如果 `cur` 存在而 `tgt` 不存在，会把 cur.app 的位置错误地更新
+2. 两次 updateIndex 调用在 transaction 内，但逻辑有误
+3. 没有处理 `cur.grid_index === index` 的情况（不需要移动）
+
+**复现场景**: 把应用从位置 3 拖到位置 7（位置 7 为空），位置 3 的应用会被错误更新。
+
+**修复建议**:
+```typescript
+ipcMain.handle('update-app-position', (_, { path, index }) => {
+  const cur = db.prepare('SELECT grid_index FROM pinned_apps WHERE path = ?').get(path) as any
+  if (!cur || cur.grid_index === index) return stmts.getPinned.all()
+
+  db.transaction(() => {
+    // 先清除目标位置（如果有应用的话）
+    const tgt = stmts.getByIndex.get(index) as any
+    if (tgt && tgt.path !== path) {
+      stmts.updateIndex.run(cur.grid_index, tgt.path)
+    }
+    stmts.updateIndex.run(index, path)
+  })()
+  return stmts.getPinned.all()
+})
+```
+
+---
+
+### 3. 【严重】launch 事件路径验证 Race Condition 🟠
+
+**位置**: [index.ts:141-152](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L141-L152)
+
+**问题描述**:
+```typescript
+ipcMain.on('launch', (_, path: string) => {
+  const safePath = normalize(path)
+  if (!existsSync(safePath)) return  // ⚠️ existsSync 检查后，文件可能在检查和打开之间被删除/移动
   try {
-    spawn('taskkill', ['/F', '/IM', 'Everything.exe'], { shell: true })
+    stmts.incrementUsage.run(safePath)
+    // ... launch logic
   } catch (e) {}
 })
 ```
 
----
+**问题**:
+1. `existsSync` 和实际 `shell.openPath` 之间存在时间窗口，文件可能在此期间被删除
+2. `normalize` 没有处理 UNC 路径 `\\server\share` 的特殊情况
+3. 吞掉了所有异常，可能导致静默失败
 
-### ❌ 问题 2：命令注入风险
-**位置**: `src/main/index.ts:148-150`
-
+**修复建议**:
 ```typescript
-const psCommand = `Start-Process "${safePath}" -Verb RunAs`
-exec(`powershell -Command "${psCommand.replace(/"/g, '`"')}"`, ...)
-```
-
-**风险**：路径中包含反引号 `` ` `` 时可能被注入
-
-**修复建议**：
-```typescript
-const safePath = normalize(path)
-if (!safePath || !existsSync(safePath)) return
-
-if (!/^[a-zA-Z]:\\/.test(safePath)) {
-  console.error('[LAUNCH] 非法路径格式:', safePath)
-  return
-}
-
-const psCommand = `Start-Process -FilePath "${safePath.replace(/"/g, '')}" -Verb RunAs`
-exec(`powershell -NoProfile -Command "${psCommand}"`, (err) => {
-  if (err) {
-    console.error('[LAUNCH] 提权启动失败:', err)
-    shell.openPath(safePath)
+ipcMain.on('launch', (_, path: string) => {
+  try {
+    const safePath = normalize(path)
+    if (!safePath || typeof safePath !== 'string') return
+    if (!existsSync(safePath)) {
+      console.warn('[LAUNCH] 文件不存在:', safePath)
+      return
+    }
+    stmts.incrementUsage.run(safePath)
+    // 使用 shell.openPath 而不是 exec powershell，更可靠
+    const opened = await shell.openPath(safePath)
+    if (opened) console.error('[LAUNCH] 打开失败:', opened)
+  } catch (e) {
+    console.error('[LAUNCH] 启动异常:', e)
   }
   BrowserWindow.getAllWindows().forEach(w => w.hide())
 })
@@ -76,420 +126,269 @@ exec(`powershell -NoProfile -Command "${psCommand}"`, (err) => {
 
 ---
 
-### ❌ 问题 3：热键初始化可能访问 undefined
-**位置**: `src/main/index.ts:11`
+## 二、中等级别问题（可能导致功能异常或性能问题）
 
+### 4. 【中等】热键注册失败处理不一致 🟡
+
+**位置**: [index.ts:50-64](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L50-L64)
+
+**问题描述**:
 ```typescript
-let currentHotkey = (stmts.getSetting?.get('hotkey') as any)?.value || 'Alt+Q'
-```
-
-**风险**：`stmts` 在 db.ts 中定义为可选链 `db?.prepare()`，如果 db 初始化失败，`stmts.getSetting` 为 undefined
-
-**修复建议**：
-```typescript
-let currentHotkey = 'Alt+Q'
-try {
-  if (stmts?.getSetting) {
-    const saved = stmts.getSetting.get('hotkey') as any
-    if (saved?.value) currentHotkey = saved.value
-  }
-} catch (e) {
-  console.error('[HOTKEY] 读取保存的热键失败:', e)
-}
-```
-
----
-
-### ✅ 问题 4：已修复 - closeDb 空检查
-`db.ts:42-46` 已添加检查
-
----
-
-### ✅ 问题 5：已修复 - 图标缓存内存泄漏
-`src/main/index.ts:14-27` 已添加 MAX_CACHE_SIZE 和 LRU 淘汰
-
----
-
-### ✅ 问题 6：已修复 - search 空指针风险
-`src/main/index.ts:126` 已使用 `usage?.count ?? 0`
-
----
-
-### ✅ 问题 7：已修复 - 热键注册竞态条件
-`src/main/index.ts:49-72` 已改为"先注册成功再注销旧热键"
-
----
-
-## 🟡 中严重程度问题（13个）- 建议修复
-
-### ❌ 问题 8：app.whenReady 无错误处理
-**位置**: `src/main/index.ts:161-168`
-
-```typescript
-app.whenReady().then(() => {
-  electronApp.setAppUserModelId('com.huochat.launcher')
-  startEverything()
-  const win = createWindow()
-  if (win) registerMainHotkey(win)
-})
-```
-
-**修复建议**：
-```typescript
-app.whenReady().then(() => {
+function safeRegisterHotkey(win: BrowserWindow, newHotkey: string) {
+  const oldHotkey = currentHotkey
   try {
-    electronApp.setAppUserModelId('com.huochat.launcher')
-    startEverything()
-    const win = createWindow()
-    if (!win) {
-      console.error('[MAIN] 窗口创建失败')
-      app.quit()
-      return
+    const success = globalShortcut.register(newHotkey, handler)
+    if (success) {
+      if (oldHotkey !== newHotkey) globalShortcut.unregister(oldHotkey)
+      currentHotkey = newHotkey
+      stmts.setSetting.run('hotkey', newHotkey)  // ⚠️ 数据库写入在 try 块内
+      return { success: true }
     }
-    registerMainHotkey(win)
-  } catch (err) {
-    console.error('[MAIN] 启动过程崩溃:', err)
-    app.quit()
+    return { success: false, message: '快捷键已被占用' }
+  } catch (err: any) {  // ⚠️ catch 块吞掉了错误，但没有回滚任何状态
+    return { success: false, message: err.message }
   }
-}).catch(err => {
-  console.error('[MAIN] 应用就绪失败:', err)
-  app.quit()
-})
-```
-
----
-
-### ❌ 问题 9：loadPinned 缺少 .catch()
-**位置**: `src/renderer/src/App.tsx:28-31`
-
-```typescript
-const loadPinned = useCallback(() => {
-  window.api.getPinnedApps().then(apps => setState(s => ({ ...s, pinnedApps: apps }))).catch(console.error)
-}, [])
-```
-
-**说明**：虽然有 .catch(console.error)，但应该添加用户提示
-
-**修复建议**：
-```typescript
-const loadPinned = useCallback(() => {
-  window.api.getPinnedApps()
-    .then(apps => setState(s => ({ ...s, pinnedApps: apps || [] })))
-    .catch(err => {
-      console.error('[UI] 加载固定应用失败:', err)
-      setState(s => ({ ...s, pinnedApps: [] }))
-    })
-}, [])
-```
-
----
-
-### ❌ 问题 10：select-file IPC 未实现路径验证
-**位置**: 主进程缺少对应 handler
-
-**修复建议**：在 index.ts 中添加：
-```typescript
-ipcMain.handle('select-file', async () => {
-  const result = await dialog.showOpenDialog({
-    properties: ['openFile'],
-    filters: [
-      { name: '快捷方式', extensions: ['exe', 'lnk', 'url'] }
-    ]
-  })
-  if (result.canceled || !result.filePaths[0]) return null
-
-  const filePath = result.filePaths[0]
-  if (!existsSync(filePath)) return null
-
-  return {
-    path: filePath,
-    name: filePath.split(/[\\\/]/).pop() || '',
-    icon: await getCachedIcon(filePath)
-  }
-})
-```
-
----
-
-### ❌ 问题 11：DragOverlay 未限制边界
-**位置**: `src/renderer/src/components/LaunchpadGrid.tsx:110-112`
-
-**修复建议**：
-```typescript
-<DragOverlay
-  dropAnimation={{
-    sideEffects: defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } })
-  }}
->
-  {activeItem ? (
-    <div
-      className="w-[90px]"
-      style={{
-        transform: 'translate(0, 0)',
-        maxX: window.innerWidth - 100,
-        maxY: window.innerHeight - 100
-      }}
-    >
-      <AppIcon item={activeItem} isOverlay />
-    </div>
-  ) : null}
-</DragOverlay>
-```
-
----
-
-### ❌ 问题 12：findFirstEmpty 未考虑 grid_index=-1
-**位置**: `src/renderer/src/App.tsx:123-127`
-
-**修复建议**：
-```typescript
-const findFirstEmpty = (apps: any[]) => {
-  const usedIndices = new Set(apps.map(a => a.grid_index).filter(i => i >= 0))
-  let i = 0
-  while (usedIndices.has(i)) i++
-  return Math.min(i, 49)
 }
 ```
 
----
+**问题**:
+1. 如果 `globalShortcut.register` 成功但 `stmts.setSetting.run` 失败，currentHotkey 已经更新但数据库没更新
+2. `oldHotkey` 已经在函数开头保存，但如果注册成功且是同一个热键，不会 unregister，但 currentHotkey 还是会被设为同一个值（虽然没实际影响）
 
-### ❌ 问题 13：registerMainHotkey 与 safeRegisterHotkey 重复
-**位置**: `src/main/index.ts:170-175`
-
-**修复建议**：复用 safeRegisterHotkey
+**修复建议**:
 ```typescript
-function registerMainHotkey(win: BrowserWindow) {
-  const result = safeRegisterHotkey(win, currentHotkey)
-  if (!result.success) {
-    console.error('[HOTKEY] 初始热键注册失败:', result.message)
+function safeRegisterHotkey(win: BrowserWindow, newHotkey: string) {
+  const oldHotkey = currentHotkey
+  if (oldHotkey === newHotkey) return { success: true }
+
+  try {
+    globalShortcut.register(newHotkey, handler)
+    if (oldHotkey) globalShortcut.unregister(oldHotkey)
+    stmts.setSetting.run('hotkey', newHotkey)
+    currentHotkey = newHotkey
+    return { success: true }
+  } catch (err: any) {
+    // 注册失败时不尝试 unregister（本来就没注册成功）
+    return { success: false, message: err.message }
   }
 }
 ```
 
 ---
 
-### ❌ 问题 14：onWindowShown 可能重复监听
-**位置**: `src/renderer/src/components/SearchBar.tsx:13-24`
+### 5. 【中等】窗口 blur 事件隐藏逻辑缺陷 🟡
 
-**修复建议**：
+**位置**: [index.ts:79](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L79)
+
+**问题描述**:
 ```typescript
-useEffect(() => {
-  let removeListener: (() => void) | undefined
+win.on('blur', () => {
+  setTimeout(() => {
+    if (!win.isDestroyed()) win.hide()  // ⚠️ 100ms 后才检查，窗口可能已经不可用
+  }, 100)
+})
+```
 
+**问题**:
+1. 100ms 延迟可能导致用户点击窗口内容时窗口已经隐藏（用户点击和 blur 几乎同时发生时）
+2. 没有区分是点击窗口内部还是外部的 blur
+
+**修复建议**:
+```typescript
+win.on('blur', () => {
+  // 使用更长的延迟，或者在 mousedown 事件中标记
+  setTimeout(() => {
+    if (!win.isDestroyed() && !win.webContents.isDevToolsOpened()) {
+      win.hide()
+    }
+  }, 200)
+})
+
+// 在点击窗口时阻止隐藏（通过 IPC 通知主进程）
+win.webContents.on('before-input-event', (event, input) => {
+  if (input.type === 'mouseDown') {
+    // 用户在窗口内点击，标记为不隐藏
+  }
+})
+```
+
+---
+
+### 6. 【中等】SQL 语句参数化不完整 🟡
+
+**位置**: [db.ts:14-18](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/db.ts#L14-L18)
+
+**问题描述**:
+```typescript
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pinned_apps (...);
+  CREATE TABLE IF NOT EXISTS usage_stats (...);
+  CREATE TABLE IF NOT EXISTS settings (...);
+  INSERT OR IGNORE INTO settings (key, value) VALUES ('hotkey', 'Alt+Q');
+  INSERT OR IGNORE INTO settings (key, value) VALUES ('db_version', '1');
+`)
+```
+
+**问题**:
+1. 直接拼接 `db_version` 值，如果未来版本管理不当可能造成注入风险
+2. 迁移逻辑只是注释，没有实际实现
+
+**当前状态**: 实际上这里没有用户输入，所以风险较低，但不符合安全最佳实践。
+
+---
+
+### 7. 【中等】Everything 进程退出事件处理 🟡
+
+**位置**: [index.ts:47](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L47)
+
+**问题描述**:
+```typescript
+everythingProcess.on('exit', () => everythingProcess = null)
+```
+
+**问题**:
+1. `exit` 事件在进程退出时触发，但如果是被杀死的（taskkill），exit code 不为 0
+2. 没有监听 `error` 事件来处理启动失败
+3. 没有重试机制
+
+**修复建议**:
+```typescript
+everythingProcess.on('error', (err) => {
+  console.error('[Everything] 启动失败:', err)
+  everythingProcess = null
+  // 可以在这里添加重试逻辑
+})
+
+everythingProcess.on('exit', (code) => {
+  console.log('[Everything] 退出, code:', code)
+  everythingProcess = null
+})
+```
+
+---
+
+## 三、低级别问题（代码质量/健壮性）
+
+### 8. 【低】preload 上下文隔离检查不准确 ⚪
+
+**位置**: [preload/index.ts:22-31](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/preload/index.ts#L22-L31)
+
+**问题**:
+```typescript
+if (process.contextIsolated) {
+  try {
+    contextBridge.exposeInMainWorld('electron', electronAPI)
+    contextBridge.exposeInMainWorld('api', api)
+  } catch (error) { console.error(error) }
+} else {
   // @ts-ignore
-  if (window.api?.onWindowShown) {
-    // @ts-ignore
-    removeListener = window.api.onWindowShown(() => {
-      setQuery('')
-      setTimeout(() => inputRef.current?.focus(), 50)
-    })
-  }
-
-  return () => {
-    if (removeListener) {
-      removeListener()
-      removeListener = undefined
-    }
-  }
-}, [setQuery])
+  window.electron = electronAPI
+  // @ts-ignore
+  window.api = api
+}
 ```
 
----
+`process.contextIsolated` 在某些 Electron 版本中可能不准确，应该依赖 `contextBridge` 是否存在来判断。
 
-### ❌ 问题 15：handlePin 返回值未检查
-**位置**: `src/renderer/src/App.tsx:132-138`
-
-**修复建议**：
+**修复建议**:
 ```typescript
-const handlePin = async (e: any, item: any) => {
-  e.stopPropagation()
-  const index = findFirstEmpty(state.pinnedApps)
-  try {
-    const newPinned = await window.api.pinApp(item, index)
-    if (newPinned) {
-      setState(s => ({ ...s, pinnedApps: newPinned, query: '' }))
-    }
-  } catch (err) {
-    console.error('[UI] 固定应用失败:', err)
-  }
+if (typeof contextBridge !== 'undefined' && typeof contextBridge.exposeInMainWorld === 'function') {
+  contextBridge.exposeInMainWorld('electron', electronAPI)
+  contextBridge.exposeInMainWorld('api', api)
+} else {
+  // @ts-ignore
+  window.electron = electronAPI
+  // @ts-ignore
+  window.api = api
 }
 ```
 
 ---
 
-### ❌ 问题 16：launch IPC 隐藏窗口时机不当
-**位置**: `src/main/index.ts:156`
+### 9. 【低】App.tsx 中 stateRef 同步问题 ⚪
 
-**修复建议**：
+**位置**: [App.tsx:36-37](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/renderer/src/App.tsx#L36-L37)
+
+**问题**:
 ```typescript
-exec(`powershell -Command "${psCommand}"`, (err) => {
-  if (err) {
-    console.error('[LAUNCH] 提权启动失败，尝试普通启动:', err)
-    shell.openPath(safePath).then(result => {
-      if (result !== '') {
-        console.error('[LAUNCH] 普通启动也失败:', result)
-        return
-      }
-      BrowserWindow.getAllWindows().forEach(w => w.hide())
-    })
-  } else {
-    BrowserWindow.getAllWindows().forEach(w => w.hide())
-  }
-})
+const stateRef = useRef(state)
+stateRef.current = state
 ```
+
+在 React 19 + Concurrent Mode 下，这种同步方式在 `useCallback` 中使用 `stateRef.current` 可能读到过期状态。应该使用 `useRef` 的 setter 模式或 `useSyncExternalStore`。
+
+**影响**: 低，因为当前代码中 React 版本较新但并发特性没有完全启用。
 
 ---
 
-### ❌ 问题 17：grid_index 可能为 -1 的边界问题
-**位置**: `src/renderer/src/App.tsx:106`
+### 10. 【低】handlePin 返回值未校验 ⚪
 
-**修复建议**：
+**位置**: [App.tsx:153-161](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/renderer/src/App.tsx#L153-L161)
+
+**问题**:
 ```typescript
-if (isGrid) {
-  const pinned = pinnedApps.find(a => a.grid_index === selectedIndex && a.grid_index >= 0)
-  if (pinned) window.api.launch(pinned.path)
+const newPinned = await window.api.pinApp(item, index)
+if (newPinned) setState(s => ({ ...s, pinnedApps: newPinned, query: '' }))
+```
+
+如果 `pinApp` 返回 `undefined`（IPC 调用失败但没抛异常），代码仍然会清空搜索结果。
+
+**修复建议**: 添加更多校验或依赖乐观更新。
+
+---
+
+## 四、安全问题
+
+### 11. 【安全】launch 路径注入风险
+
+**位置**: [index.ts:145-147](file:///c:/Users/VerNe/Downloads/Documents/huochat/src/main/index.ts#L145-L147)
+
+**问题**:
+```typescript
+const psCommand = `Start-Process -FilePath "${safePath.replace(/"/g, '')}" -Verb RunAs`
+exec(`powershell -NoProfile -Command "${psCommand}"`, ...)
+```
+
+虽然使用了 `replace(/"/g, '')` 过滤引号，但仍然存在风险：
+1. `safePath` 可能包含特殊字符导致 PowerShell 命令注入
+2. `replace` 只处理引号，其他危险字符（如 `;`, `&`, `|`）没有处理
+
+**当前风险评估**: 低（因为路径已经过 `normalize` 和 `existsSync` 检查），但建议改进。
+
+**修复建议**:
+```typescript
+// 使用 shell.openPath 代替 PowerShell exec，更安全
+const opened = await shell.openPath(safePath)
+if (opened) {
+  // 如果普通打开失败，尝试管理员权限
+  const adminCommand = `Start-Process -FilePath "${safePath.replace(/"/g, '`"')}" -Verb RunAs`
+  exec(`powershell -NoProfile -Command "${adminCommand}"`, ...)
 }
 ```
 
 ---
 
-### ❌ 问题 18：update-app-position 缺少越界检查
-**位置**: `src/main/index.ts:100-113`
+## 五、问题汇总表
 
-**修复建议**：
-```typescript
-ipcMain.handle('update-app-position', (_, { path, index }) => {
-  if (typeof index !== 'number' || index < 0 || index >= 50) {
-    console.error('[DB] 无效的网格索引:', index)
-    return stmts.getPinned.all()
-  }
-})
-```
-
----
-
-### ✅ 问题 19-21：已修复
-- handleDrop 效率低 - 已优化
-- useEffect 依赖过多 - 已用 useCallback
-- 数据库迁移过于简单 - 已有基础结构
+| 编号 | 问题 | 级别 | 影响 |
+|------|------|------|------|
+| 1 | 数据库 prepare 空指针 | 🔴 严重 | 应用崩溃 |
+| 2 | updateIndex 死锁与数据竞争 | 🟠 严重 | 数据错乱 |
+| 3 | launch 路径验证 Race Condition | 🟠 严重 | 启动失败 |
+| 4 | 热键注册失败处理不一致 | 🟡 中等 | 状态不一致 |
+| 5 | 窗口 blur 隐藏逻辑缺陷 | 🟡 中等 | 用户体验 |
+| 6 | SQL 参数化不完整 | 🟡 中等 | 未来风险 |
+| 7 | Everything 退出事件处理 | 🟡 中等 | 进程管理 |
+| 8 | preload 上下文隔离检查 | ⚪ 低 | 代码质量 |
+| 9 | stateRef 同步问题 | ⚪ 低 | 未来兼容 |
+| 10 | handlePin 返回值未校验 | ⚪ 低 | 状态错误 |
+| 11 | launch 路径注入风险 | ⚪ 低 | 安全性 |
 
 ---
 
-## 🟢 低严重程度问题（19个）- 可选优化
+## 六、优先修复顺序建议
 
-| # | 问题 | 位置 | 修复建议 |
-|---|------|------|---------|
-| 1 | **SearchList key 不应拼接 index** | SearchList.tsx:28 | 使用 `item.path` 作为 key |
-| 2 | **grid 拖拽后 index 验证** | LaunchpadGrid.tsx:95 | 添加 `newIndex >= 0 && newIndex < 50` |
-| 3 | **unregisterAll 范围过大** | index.ts:181 | 只注销本应用的热键 |
-| 4 | **热键正则不验证合法性** | App.tsx:72 | 添加格式验证 |
-| 5 | **search 防抖 150ms 可优化** | App.tsx:55 | 考虑动态防抖 |
-| 6 | **图标获取并发控制** | index.ts:117 | 添加并发限制 |
-| 7 | **state 可用 useReducer** | App.tsx:13-23 | 简化状态管理 |
-| 8 | **SQL 注入潜在风险** | db.ts:39 | 验证 key 格式 |
-| 9 | **ArrowUp/ArrowDown 跳跃困惑** | App.tsx:94-101 | 考虑网格按行导航 |
-| 10 | **Enter 键边界检查** | App.tsx:103-111 | 添加显式边界验证 |
-| 11 | **firstEmpty 未检查上限** | App.tsx:123-127 | 限制最大 49 |
-| 12 | **窗口 blur 直接 hide** | index.ts:82 | 可添加延迟 |
-| 13 | **pinApp 返回值未检查** | App.tsx:136 | 添加 try-catch |
-| 14 | **拖拽时未禁止滚动** | LaunchpadGrid.tsx | 添加 touch-action |
-| 15 | **数据库路径创建无 try-catch** | db.ts:6-7 | 包装 mkdirSync |
-| 16 | **ON CONFLICT 无日志** | db.ts:36 | 添加调试日志 |
-| 17 | **set-hotkey 失败无详细日志** | index.ts:66 | 添加 console.error |
-| 18 | **isLoaded 检查不完善** | sdk.ts:33 | 添加更多检查 |
-
----
-
-## 📋 修复清单
-
-### 🔥 第一优先级（必须修复 - 共 3 个）
-
-| # | 问题 | 文件 | 修复代码量 |
-|---|------|------|-----------|
-| 1 | detached 进程管理 | src/main/index.ts | ~15 行 |
-| 2 | 命令注入防护 | src/main/index.ts | ~10 行 |
-| 3 | 热键初始化空检查 | src/main/index.ts | ~8 行 |
-
-### ⚠️ 第二优先级（建议修复 - 共 8 个）
-
-| # | 问题 | 文件 |
-|---|------|------|
-| 4 | app.whenReady 错误处理 | src/main/index.ts |
-| 5 | loadPinned 完善错误处理 | src/renderer/src/App.tsx |
-| 6 | select-file IPC 路径验证 | src/main/index.ts |
-| 7 | DragOverlay 边界限制 | src/renderer/src/components/LaunchpadGrid.tsx |
-| 8 | findFirstEmpty 上限检查 | src/renderer/src/App.tsx |
-| 9 | registerMainHotkey 复用 | src/main/index.ts |
-| 10 | onWindowShown 防重复 | src/renderer/src/components/SearchBar.tsx |
-| 11 | handlePin 返回值检查 | src/renderer/src/App.tsx |
-
-### 💡 第三优先级（可选优化 - 共 19 个）
-
-可根据时间和资源情况逐步优化。
-
----
-
-## 📊 总结
-
-```
-修复工作量估算：
-━━━━━━━━━━━━━━━━━━━━━━
-第一优先级（必须）: 约 35 行代码
-第二优先级（建议）: 约 60 行代码
-第三优先级（可选）: 约 40 行代码
-━━━━━━━━━━━━━━━━━━━━━━
-总计               : 约 135 行代码
-```
-
-**建议**：优先修复第一优先级的 3 个问题，这将是代码安全性和稳定性的关键保障。
-
----
-
-## 问题清单汇总表
-
-| # | 严重程度 | 问题 | 文件位置 | 状态 |
-|---|----------|------|----------|------|
-| 1 | 高 | detached 进程无法监控 | src/main/index.ts:38 | ❌ 未修复 |
-| 2 | 高 | 命令注入风险 | src/main/index.ts:148-150 | ❌ 未修复 |
-| 3 | 高 | 热键初始化可能 undefined | src/main/index.ts:11 | ❌ 未修复 |
-| 4 | 高 | closeDb 空检查 | src/main/db.ts:49-50 | ✅ 已修复 |
-| 5 | 高 | 图标缓存内存泄漏 | src/main/index.ts:14-22 | ✅ 已修复 |
-| 6 | 高 | search 空指针风险 | src/main/index.ts:73-80 | ✅ 已修复 |
-| 7 | 高 | 热键注册竞态条件 | src/main/index.ts:51-58 | ✅ 已修复 |
-| 8 | 中 | app.whenReady 无错误处理 | src/main/index.ts:120-121 | ❌ 未修复 |
-| 9 | 中 | loadPinned 缺少 .catch() | src/renderer/src/App.tsx:18-19 | ❌ 未修复 |
-| 10 | 中 | select-file 无路径验证 | src/main/index.ts:85 | ❌ 未修复 |
-| 11 | 中 | DragOverlay 未限制边界 | src/renderer/src/components/LaunchpadGrid.tsx:110 | ❌ 未修复 |
-| 12 | 中 | findFirstEmpty 未考虑 -1 | src/renderer/src/App.tsx:123-127 | ❌ 未修复 |
-| 13 | 中 | registerMainHotkey 重复 | src/main/index.ts:170-175 | ❌ 未修复 |
-| 14 | 中 | onWindowShown 重复监听 | src/renderer/src/components/SearchBar.tsx:13-24 | ❌ 未修复 |
-| 15 | 中 | handlePin 返回值未检查 | src/renderer/src/App.tsx:132-138 | ❌ 未修复 |
-| 16 | 中 | launch 隐藏窗口时机 | src/main/index.ts:156 | ❌ 未修复 |
-| 17 | 中 | grid_index 可能为 -1 | src/renderer/src/App.tsx:106 | ❌ 未修复 |
-| 18 | 中 | update-app-position 越界 | src/main/index.ts:100-113 | ❌ 未修复 |
-| 19 | 中 | handleDrop 效率低 | src/renderer/src/App.tsx:115-129 | ✅ 已修复 |
-| 20 | 中 | useEffect 依赖过多 | src/renderer/src/App.tsx:38-76 | ✅ 已修复 |
-| 21 | 中 | 数据库迁移过于简单 | src/main/db.ts:31-36 | ✅ 已修复 |
-| 22 | 低 | SearchList key 拼接 index | src/renderer/src/components/SearchList.tsx:28 | ❌ 未修复 |
-| 23 | 低 | grid 拖拽 index 验证 | src/renderer/src/components/LaunchpadGrid.tsx:95 | ❌ 未修复 |
-| 24 | 低 | unregisterAll 范围过大 | src/main/index.ts:181 | ❌ 未修复 |
-| 25 | 低 | 热键正则不验证 | src/renderer/src/App.tsx:72 | ❌ 未修复 |
-| 26 | 低 | search 防抖较长 | src/renderer/src/App.tsx:55 | ❌ 未修复 |
-| 27 | 低 | 图标获取并发 | src/main/index.ts:117 | ❌ 未修复 |
-| 28 | 低 | state 可合并 | src/renderer/src/App.tsx:13-23 | ❌ 未修复 |
-| 29 | 低 | SQL 注入潜在风险 | src/main/db.ts:39 | ❌ 未修复 |
-| 30 | 低 | ArrowUp/Down 跳跃困惑 | src/renderer/src/App.tsx:94-101 | ❌ 未修复 |
-| 31 | 低 | Enter 键边界检查 | src/renderer/src/App.tsx:103-111 | ❌ 未修复 |
-| 32 | 低 | firstEmpty 未检查上限 | src/renderer/src/App.tsx:123-127 | ❌ 未修复 |
-| 33 | 低 | 窗口 blur 直接 hide | src/main/index.ts:82 | ❌ 未修复 |
-| 34 | 低 | 拖拽时未禁止滚动 | src/renderer/src/components/LaunchpadGrid.tsx | ❌ 未修复 |
-| 35 | 低 | 数据库路径创建无 try-catch | src/main/db.ts:6-7 | ❌ 未修复 |
-| 36 | 低 | ON CONFLICT 无日志 | src/main/db.ts:36 | ❌ 未修复 |
-| 37 | 低 | set-hotkey 失败无日志 | src/main/index.ts:66 | ❌ 未修复 |
-| 38 | 低 | isLoaded 检查不完善 | src/main/sdk.ts:33 | ❌ 未修复 |
-| 39 | 低 | indexOf 应改 includes | src/renderer/src/App.tsx:47-48 | ✅ 已修复 |
-| 40 | 低 | grid 查找效率低 | src/renderer/src/components/LaunchpadGrid.tsx:80-82 | ✅ 已修复 |
-| 41 | 低 | process-paths 类型丢失 | src/main/index.ts:88-94 | ✅ 已修复 |
-| 42 | 低 | BrowserWindow 验证缺失 | src/main/index.ts:52 | ❌ 未修复 |
-| 43 | 低 | 数据库迁移逻辑简单 | src/main/db.ts:31-36 | ❌ 未修复 |
-| 44 | 低 | state 合并可优化 | src/renderer/src/App.tsx:11-16 | ❌ 未修复 |
+1. **立即修复**: 问题 1（数据库空指针）、问题 2（updateIndex 死锁）
+2. **本周内修复**: 问题 3（Race Condition）、问题 4（热键处理）
+3. **计划内修复**: 问题 5-7
+4. **代码优化**: 问题 8-11

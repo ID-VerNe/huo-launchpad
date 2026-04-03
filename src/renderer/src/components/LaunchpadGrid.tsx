@@ -1,4 +1,4 @@
-import { Trash2 } from 'lucide-react'
+import { Trash2, Folder, FileText } from 'lucide-react'
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 import { useSortable, SortableContext, rectSortingStrategy } from '@dnd-kit/sortable'
@@ -10,6 +10,14 @@ function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)) }
 
 function AppIcon({ item, isPlaceholder, isOverlay }: any) {
   if (!item) return null
+  
+  // 核心视觉策略：
+  // 1. 如果检测到是文件夹（包括快捷方式指向的文件夹），统一强制使用高质量 SVG 文件夹图标
+  // 2. 如果系统提取的 icon 过短（代表无效或空白），则使用文件 SVG 兜底
+  const isFolder = item.extension === 'folder'
+  const isInvalidIcon = !item.icon || item.icon.length < 500
+  const showFallback = isFolder || isInvalidIcon
+
   return (
     <div className={cn(
       "flex flex-col items-center justify-start p-2 rounded-[8px] w-full h-[100px] relative transition-all duration-200",
@@ -17,7 +25,15 @@ function AppIcon({ item, isPlaceholder, isOverlay }: any) {
       isOverlay ? "scale-110 shadow-2xl bg-[#B8D8FF]/80 backdrop-blur-sm rotate-2 ring-2 ring-blue-400/30" : ""
     )}>
       <div className="w-12 h-12 mb-2 flex items-center justify-center pointer-events-none">
-        <img src={item.icon} alt={item.name} className="w-10 h-10 object-contain drop-shadow-md" />
+        {showFallback ? (
+          isFolder ? (
+            <Folder className="w-10 h-10 text-yellow-500 fill-yellow-400/30 drop-shadow-sm" />
+          ) : (
+            <FileText className="w-10 h-10 text-blue-400/80 drop-shadow-sm" />
+          )
+        ) : (
+          <img src={item.icon} alt={item.name} className="w-10 h-10 object-contain drop-shadow-md" />
+        )}
       </div>
       <span className="text-[11px] text-center w-full truncate px-1 text-[#444] font-semibold pointer-events-none tracking-tight">
         {item.name}
@@ -90,11 +106,7 @@ export default function LaunchpadGrid({ pinnedApps, selectedIndex, onLaunch, onU
       const newIndex = targetId.startsWith('empty-') 
         ? parseInt(targetId.split('-')[1]) 
         : grid.findIndex(g => g?.path === targetId)
-      
-      // --- 修复问题 23: 增加 index 范围验证 ---
-      if (!isNaN(newIndex) && newIndex >= 0 && newIndex < 50) {
-        onReorder(active.id, newIndex)
-      }
+      if (!isNaN(newIndex) && newIndex >= 0 && newIndex < 50) onReorder(active.id, newIndex)
     }
   }
 
@@ -107,13 +119,8 @@ export default function LaunchpadGrid({ pinnedApps, selectedIndex, onLaunch, onU
           ))}
         </div>
       </SortableContext>
-      {/* 修复 TODO 7: DragOverlay 样式优化 */}
       <DragOverlay dropAnimation={{ sideEffects: defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } }) }}>
-        {activeItem ? (
-          <div className="w-[90px] pointer-events-none select-none">
-            <AppIcon item={activeItem} isOverlay />
-          </div>
-        ) : null}
+        {activeItem ? <div className="w-[90px] pointer-events-none select-none"><AppIcon item={activeItem} isOverlay /></div> : null}
       </DragOverlay>
     </DndContext>
   )

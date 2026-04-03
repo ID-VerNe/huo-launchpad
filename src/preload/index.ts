@@ -12,18 +12,22 @@ const api = {
   selectFile: () => ipcRenderer.invoke('select-file'),
   processPaths: (paths: string[]) => ipcRenderer.invoke('process-paths', paths),
   onWindowShown: (callback: any) => {
-    ipcRenderer.on('window-shown', callback)
-    return () => ipcRenderer.removeListener('window-shown', callback)
+    const subscription = (_event: any) => callback()
+    ipcRenderer.on('window-shown', subscription)
+    return () => ipcRenderer.removeListener('window-shown', subscription)
   },
   getHotkey: () => ipcRenderer.invoke('get-hotkey'),
   setHotkey: (h: string) => ipcRenderer.invoke('set-hotkey', h)
 }
 
-if (process.contextIsolated) {
+// 审计建议 #8: 更严谨的上下文隔离检查
+if (typeof contextBridge !== 'undefined' && contextBridge.exposeInMainWorld) {
   try {
     contextBridge.exposeInMainWorld('electron', electronAPI)
     contextBridge.exposeInMainWorld('api', api)
-  } catch (error) { console.error(error) }
+  } catch (error) {
+    console.error('[PRELOAD] ContextBridge 暴露失败:', error)
+  }
 } else {
   // @ts-ignore
   window.electron = electronAPI
