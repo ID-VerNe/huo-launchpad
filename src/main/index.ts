@@ -1,8 +1,8 @@
 import { app, shell, BrowserWindow, ipcMain, globalShortcut, dialog } from 'electron'
 import { join } from 'path'
 import { electronApp, is } from '@electron-toolkit/utils'
-import { spawn, ChildProcess } from 'child_process'
-import { writeFileSync } from 'fs'
+import { spawn, ChildProcess, exec } from 'child_process'
+import { writeFileSync, existsSync, mkdirSync } from 'fs'
 import { db, stmts, closeDb } from './db'
 import { executeQuery } from './sdk'
 
@@ -12,15 +12,12 @@ let currentHotkey = (stmts.getSetting.get('hotkey') as any)?.value || 'Alt+Q'
 
 // --- 图标缓存 ---
 const iconCache = new Map<string, string>()
-const MAX_CACHE = 200
-async function getCachedIcon(fullPath: string): Promise<string> {
-  if (iconCache.has(fullPath)) return iconCache.get(fullPath)!
+async function getCachedIcon(p: string) {
+  if (iconCache.has(p)) return iconCache.get(p)!
   try {
-    const icon = await app.getFileIcon(fullPath, { size: 'large' })
-    const dataUrl = icon.toDataURL()
-    if (iconCache.size >= MAX_CACHE) iconCache.delete(iconCache.keys().next().value!)
-    iconCache.set(fullPath, dataUrl)
-    return dataUrl
+    const icon = await app.getFileIcon(p, { size: 'large' })
+    const data = icon.toDataURL()
+    iconCache.set(p, data); return data
   } catch { return '' }
 }
 
@@ -31,19 +28,9 @@ function startEverything(): void {
   const iniContent = `[Everything]\ninstance_name=${INSTANCE_NAME}\nhttp_server_enabled=0\nrun_as_admin=0\ndb_location=${dbPath.replace(/\\/g, '/')}\n`
   writeFileSync(iniPath, iniContent)
   const binPath = is.dev ? join(process.cwd(), 'resources/bin') : join(process.resourcesPath, 'bin')
-  const exePath = join(binPath, 'Everything.exe')
-  everythingProcess = spawn(exePath, ['-config', iniPath, '-minimized'], { detached: true, stdio: 'pipe' })
-  everythingProcess.on('exit', () => everythingProcess = null)
+  // 由于本体已是管理员，此处无需再传 -admin
+  everythingProcess = spawn(join(binPath, 'Everything.exe'), ['-config', iniPath, '-minimized'], { detached: true, stdio: 'ignore' })
   everythingProcess.unref()
-}
-
-function registerMainHotkey(win: BrowserWindow) {
-  globalShortcut.unregisterAll()
-  const success = globalShortcut.register(currentHotkey, () => {
-    if (win.isVisible()) win.hide()
-    else { win.show(); win.focus(); win.webContents.send('window-shown') }
-  })
-  if (!success) console.error(`Failed to register hotkey: ${currentHotkey}`)
 }
 
 function createWindow(): BrowserWindow {
@@ -59,75 +46,79 @@ function createWindow(): BrowserWindow {
   return win
 }
 
-// --- IPC 接口 ---
+// --- IPC ---
 ipcMain.handle('get-hotkey', () => currentHotkey)
-ipcMain.handle('set-hotkey', (_, newHotkey: string) => {
-  try {
-    const win = BrowserWindow.getAllWindows()[0]
-    globalShortcut.unregister(currentHotkey)
-    const success = globalShortcut.register(newHotkey, () => {
-      if (win.isVisible()) win.hide()
-      else { win.show(); win.focus(); win.webContents.send('window-shown') }
-    })
-    if (success) {
-      currentHotkey = newHotkey
-      stmts.setSetting.run('hotkey', newHotkey)
-      return { success: true, hotkey: newHotkey }
-    }
-    // 如果失败，恢复旧热键
-    globalShortcut.register(currentHotkey, () => {
-      if (win.isVisible()) win.hide()
-      else { win.show(); win.focus(); win.webContents.send('window-shown') }
-    })
-    return { success: false, message: '热键已被占用' }
-  } catch (e: any) { return { success: false, message: e.message } }
+ipcMain.handle('set-hotkey', (_, h: string) => {
+  const win = BrowserWindow.getAllWindows()[0]
+  globalShortcut.unregister(currentHotkey)
+  if (globalShortcut.register(h, () => { win.isVisible() ? win.hide() : (win.show(), win.focus(), win.webContents.send('window-shown')) })) {
+    currentHotkey = h; stmts.setSetting.run('hotkey', h); return { success: true }
+  }
+  globalShortcut.register(currentHotkey, () => { win.isVisible() ? win.hide() : (win.show(), win.focus(), win.webContents.send('window-shown')) })
+  return { success: false, message: '被占用' }
 })
 
 ipcMain.handle('get-pinned-apps', () => stmts.getPinned.all())
 ipcMain.handle('update-app-position', (_, { path, index }) => {
-  const currentApp = db.prepare('SELECT grid_index FROM pinned_apps WHERE path = ?').get(path) as any
-  const targetOccupant = db.prepare('SELECT path FROM pinned_apps WHERE grid_index = ?').get(index) as any
+  const cur = db.prepare('SELECT grid_index FROM pinned_apps WHERE path = ?').get(path) as any
+  const tgt = db.prepare('SELECT path FROM pinned_apps WHERE grid_index = ?').get(index) as any
   db.transaction(() => {
-    if (targetOccupant && targetOccupant.path !== path) stmts.updateIndex.run(currentApp.grid_index, targetOccupant.path)
+    if (tgt && tgt.path !== path) stmts.updateIndex.run(cur.grid_index, tgt.path)
     stmts.updateIndex.run(index, path)
   })()
   return stmts.getPinned.all()
 })
-ipcMain.handle('pin-app', async (_, { item, index }) => { stmts.pin.run(item.path, item.name, item.icon, item.extension, index); return stmts.getPinned.all() })
+ipcMain.handle('pin-app', (_, { item, index }) => { stmts.pin.run(item.path, item.name, item.icon, item.extension, index); return stmts.getPinned.all() })
 ipcMain.handle('unpin-app', (_, path) => { stmts.unpin.run(path); return stmts.getPinned.all() })
-ipcMain.handle('search', async (_, query: string) => {
-  const rawResults = executeQuery(query)
-  const results = await Promise.all(rawResults.map(async (item) => {
-    const fullPath = item.folder.endsWith('\\') ? item.folder + item.name : item.folder + '\\' + item.name
-    const usage = stmts.getUsage.get(fullPath) as any
-    const iconData = await getCachedIcon(fullPath)
-    return { name: item.name.replace(/\.[^/.]+$/, ''), path: fullPath, icon: iconData, extension: item.name.split('.').pop() || 'file', usageCount: usage ? usage.count : 0 }
+ipcMain.handle('search', async (_, q: string) => {
+  const raw = executeQuery(q)
+  const res = await Promise.all(raw.map(async (i) => {
+    const p = i.folder.endsWith('\\') ? i.folder + i.name : i.folder + '\\' + i.name
+    const usage = stmts.getUsage.get(p) as any, icon = await getCachedIcon(p)
+    return { name: i.name.replace(/\.[^/.]+$/, ''), path: p, icon, extension: i.name.split('.').pop() || 'file', usageCount: usage ? usage.count : 0 }
   }))
-  return results.sort((a, b) => (b.usageCount - a.usageCount) || a.name.localeCompare(b.name))
+  return res.sort((a, b) => (b.usageCount - a.usageCount) || a.name.localeCompare(b.name))
 })
 ipcMain.handle('select-file', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog({ properties: ['openFile', 'openDirectory'] })
   if (canceled || filePaths.length === 0) return null
-  const fullPath = filePaths[0], fileName = fullPath.split(/[\\\/]/).pop() || ''
-  const iconData = await getCachedIcon(fullPath)
-  return { name: fileName.replace(/\.[^/.]+$/, ''), path: fullPath, icon: iconData, extension: fileName.split('.').pop() || 'folder' }
+  const p = filePaths[0], n = p.split(/[\\\/]/).pop() || '', icon = await getCachedIcon(p)
+  return { name: n.replace(/\.[^/.]+$/, ''), path: p, icon, extension: n.includes('.') ? n.split('.').pop() : 'folder' }
 })
 ipcMain.handle('process-paths', async (_, paths: string[]) => {
   const res = await Promise.all((paths || []).map(async (p) => {
     if (typeof p !== 'string') return null
-    const name = p.split(/[\\\/]/).pop() || '', iconData = await getCachedIcon(p)
-    return { name: name.replace(/\.[^/.]+$/, ''), path: p, icon: iconData, extension: name.split('.').pop() || 'file' }
+    const n = p.split(/[\\\/]/).pop() || '', icon = await getCachedIcon(p)
+    return { name: n.replace(/\.[^/.]+$/, ''), path: p, icon, extension: n.includes('.') ? n.split('.').pop() : 'file' }
   }))
   return res.filter(Boolean)
 })
-ipcMain.on('launch', (_, path: string) => { try { stmts.incrementUsage.run(path); shell.openPath(path) } catch(e){} BrowserWindow.getAllWindows()[0]?.hide() })
+
+// --- 核心改动：默认管理员启动 ---
+ipcMain.on('launch', (_, path: string) => {
+  try {
+    stmts.incrementUsage.run(path)
+    console.log(`[LAUNCH] 正在以管理员身份启动: ${path}`)
+    
+    // 使用 PowerShell 的强制管理员启动命令
+    const psCommand = `Start-Process "${path}" -Verb RunAs`
+    exec(`powershell -Command "${psCommand}"`, (err) => {
+      if (err) {
+        console.error('[LAUNCH] 提权启动失败，尝试普通启动:', err)
+        shell.openPath(path) // 回退到普通启动
+      }
+    })
+    
+    BrowserWindow.getAllWindows().forEach(w => w.hide())
+  } catch (e) { console.error(e) }
+})
+
 ipcMain.on('hide-window', () => BrowserWindow.getAllWindows()[0]?.hide())
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.huochat.launcher')
-  startEverything()
-  const win = createWindow()
-  registerMainHotkey(win)
+  startEverything(); const win = createWindow()
+  globalShortcut.register(currentHotkey, () => { win.isVisible() ? win.hide() : (win.show(), win.focus(), win.webContents.send('window-shown')) })
 })
 
 app.on('will-quit', () => {

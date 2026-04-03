@@ -23,6 +23,7 @@ asarUnpack:
 win:
   executableName: huochat
   artifactName: ${name}-${version}-setup.${ext}
+  requestedExecutionLevel: requireAdministrator
   target:
     - nsis
 
