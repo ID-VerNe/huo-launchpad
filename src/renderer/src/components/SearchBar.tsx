@@ -11,15 +11,26 @@ export default function SearchBar({ query, setQuery, loading }: SearchBarProps) 
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
-    // 审计建议 #5: 增加卸载清理逻辑
+    // --- 修复 TODO 10: 防重复监听与卸载清理 ---
+    let removeListener: (() => void) | undefined
+
     // @ts-ignore
-    const removeListener = window.api.onWindowShown(() => {
-      setQuery('')
-      setTimeout(() => inputRef.current?.focus(), 50)
-    })
+    if (window.api?.onWindowShown) {
+      // @ts-ignore
+      removeListener = window.api.onWindowShown(() => {
+        setQuery('')
+        // 增加延时确保 DOM 节点已在活跃窗口中
+        setTimeout(() => {
+          if (inputRef.current) inputRef.current.focus()
+        }, 60)
+      })
+    }
 
     return () => {
-      if (removeListener) removeListener()
+      if (removeListener) {
+        removeListener()
+        removeListener = undefined
+      }
     }
   }, [setQuery])
 

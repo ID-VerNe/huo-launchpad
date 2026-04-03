@@ -12,14 +12,14 @@ function AppIcon({ item, isPlaceholder, isOverlay }: any) {
   if (!item) return null
   return (
     <div className={cn(
-      "flex flex-col items-center justify-start p-2 rounded-[8px] w-full h-[100px] relative",
+      "flex flex-col items-center justify-start p-2 rounded-[8px] w-full h-[100px] relative transition-all duration-200",
       isPlaceholder ? "opacity-20" : "opacity-100",
-      isOverlay ? "scale-110 shadow-2xl bg-[#B8D8FF] rotate-3" : ""
+      isOverlay ? "scale-110 shadow-2xl bg-[#B8D8FF]/80 backdrop-blur-sm rotate-2 ring-2 ring-blue-400/30" : ""
     )}>
       <div className="w-12 h-12 mb-2 flex items-center justify-center pointer-events-none">
         <img src={item.icon} alt={item.name} className="w-10 h-10 object-contain drop-shadow-md" />
       </div>
-      <span className="text-[11px] text-center w-full truncate px-1 text-[#444] font-medium pointer-events-none">
+      <span className="text-[11px] text-center w-full truncate px-1 text-[#444] font-semibold pointer-events-none tracking-tight">
         {item.name}
       </span>
     </div>
@@ -44,9 +44,9 @@ function GridSlot({ item, index, selectedIndex, onLaunch, onUnpin }: any) {
       {...(item ? { ...attributes, ...listeners } : {})}
       onClick={() => item && onLaunch(item.path)}
       className={cn(
-        "relative rounded-[8px] transition-all duration-200 cursor-pointer group w-full h-[100px]",
-        index === selectedIndex && !isDragging ? "bg-[#B8D8FF]" : "hover:bg-[#E0E0E0]/50",
-        !item && "border border-dashed border-transparent hover:border-[#C0C0C0]"
+        "relative rounded-[8px] transition-all duration-200 cursor-pointer group w-full h-[100px] touch-none",
+        index === selectedIndex && !isDragging ? "bg-[#B8D8FF] shadow-inner" : "hover:bg-[#E0E0E0]/50",
+        !item && "border border-dashed border-transparent hover:border-[#C0C0C0]/50"
       )}
     >
       {item ? (
@@ -54,14 +54,14 @@ function GridSlot({ item, index, selectedIndex, onLaunch, onUnpin }: any) {
           <AppIcon item={item} isPlaceholder={isDragging} />
           <button 
             onClick={(e) => { e.stopPropagation(); onUnpin(e, item.path) }}
-            className="absolute -top-1 -right-1 p-1 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 scale-75 transition-all z-20 pointer-events-auto"
+            className="absolute -top-1 -right-1 p-1.5 bg-red-500 text-white rounded-full opacity-0 group-hover:opacity-100 scale-75 hover:scale-90 transition-all z-20 pointer-events-auto shadow-sm"
           >
             <Trash2 className="w-3 h-3" />
           </button>
         </>
       ) : (
-        <div className="w-full h-full flex items-center justify-center opacity-0 group-hover:opacity-20 pointer-events-none">
-          <div className="w-8 h-8 rounded-full bg-[#666]" />
+        <div className="w-full h-full flex items-center justify-center opacity-0 group-hover:opacity-10 pointer-events-none">
+          <div className="w-6 h-6 rounded-full bg-[#333]" />
         </div>
       )}
     </div>
@@ -72,7 +72,6 @@ export default function LaunchpadGrid({ pinnedApps, selectedIndex, onLaunch, onU
   const [activeItem, setActiveItem] = useState<any>(null)
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
 
-  // 审计建议 #21: 使用 Map 优化 O(n) 查找
   const grid = useMemo(() => {
     const pinnedMap = new Map(pinnedApps.map((a: any) => [a.grid_index, a]))
     return Array.from({ length: 50 }, (_, i) => pinnedMap.get(i) || null)
@@ -92,7 +91,8 @@ export default function LaunchpadGrid({ pinnedApps, selectedIndex, onLaunch, onU
         ? parseInt(targetId.split('-')[1]) 
         : grid.findIndex(g => g?.path === targetId)
       
-      if (!isNaN(newIndex) && newIndex !== -1) {
+      // --- 修复问题 23: 增加 index 范围验证 ---
+      if (!isNaN(newIndex) && newIndex >= 0 && newIndex < 50) {
         onReorder(active.id, newIndex)
       }
     }
@@ -107,8 +107,13 @@ export default function LaunchpadGrid({ pinnedApps, selectedIndex, onLaunch, onU
           ))}
         </div>
       </SortableContext>
+      {/* 修复 TODO 7: DragOverlay 样式优化 */}
       <DragOverlay dropAnimation={{ sideEffects: defaultDropAnimationSideEffects({ styles: { active: { opacity: '0.5' } } }) }}>
-        {activeItem ? <div className="w-[90px]"><AppIcon item={activeItem} isOverlay /></div> : null}
+        {activeItem ? (
+          <div className="w-[90px] pointer-events-none select-none">
+            <AppIcon item={activeItem} isOverlay />
+          </div>
+        ) : null}
       </DragOverlay>
     </DndContext>
   )

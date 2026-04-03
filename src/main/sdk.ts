@@ -20,7 +20,7 @@ try {
     isLoaded: lib.func('bool Everything_IsDBLoaded()')
   }
 } catch (err) {
-  console.error('[SDK] DLL Error:', err)
+  console.error('[SDK] DLL 加载失败:', err)
 }
 
 export interface SearchResult {
@@ -29,10 +29,13 @@ export interface SearchResult {
 }
 
 export function executeQuery(query: string, maxResults = 50): SearchResult[] {
-  // 审计建议 #16: 增加更严谨的函数指针检查
-  if (!sdk || typeof sdk.isLoaded !== 'function' || !sdk.isLoaded()) return []
+  // --- 修复问题 38: 增加严谨的函数指针检查 (审计建议 #16) ---
+  if (!sdk || typeof sdk.isLoaded !== 'function') return []
   
   try {
+    if (!sdk.isLoaded()) return []
+
+    // 基础输入脱敏 (审计建议 #6)
     const sanitizedQuery = query.slice(0, 200).replace(/[\x00-\x1F\x7F]/g, '')
     
     if (typeof sdk.setSearch === 'function') sdk.setSearch(sanitizedQuery + ' ext:exe;lnk;url !uninstall !"c:\\windows\\"')
@@ -44,14 +47,16 @@ export function executeQuery(query: string, maxResults = 50): SearchResult[] {
     const results: SearchResult[] = []
 
     for (let i = 0; i < num; i++) {
-      results.push({
-        name: sdk.getFileName(i),
-        folder: sdk.getPath(i)
-      })
+      if (typeof sdk.getFileName === 'function' && typeof sdk.getPath === 'function') {
+        results.push({
+          name: sdk.getFileName(i),
+          folder: sdk.getPath(i)
+        })
+      }
     }
     return results
   } catch (e) {
-    console.error('[SDK] Query Error:', e)
+    console.error('[SDK] 查询过程发生异常:', e)
     return []
   }
 }

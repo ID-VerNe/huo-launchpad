@@ -8,12 +8,23 @@ import SearchList from './components/SearchList'
 
 function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)) }
 
+interface AppState {
+  query: string
+  results: any[]
+  pinnedApps: any[]
+  loading: boolean
+  selectedIndex: number
+  isDraggingOver: boolean
+  showSettings: boolean
+  hotkey: string
+  isRecording: boolean
+}
+
 export default function App() {
-  // 合并相关状态 (审计建议 #32)
-  const [state, setState] = useState({
+  const [state, setState] = useState<AppState>({
     query: '',
-    results: [] as any[],
-    pinnedApps: [] as any[],
+    results: [],
+    pinnedApps: [],
     loading: false,
     selectedIndex: 0,
     isDraggingOver: false,
@@ -25,18 +36,32 @@ export default function App() {
   const stateRef = useRef(state)
   stateRef.current = state
 
+  // --- 修复 TODO 8: 提取工具函数并增加上限检查 ---
+  const findFirstEmpty = useCallback((apps: any[]) => {
+    const usedIndices = new Set(apps.map(a => a.grid_index).filter(i => i >= 0))
+    let i = 0
+    while (usedIndices.has(i)) i++
+    return Math.min(i, 49) // 修复 TODO 11: 限制最大 49
+  }, [])
+
+  // --- 修复 TODO 5 & 9: loadPinned 错误处理 ---
   const loadPinned = useCallback(() => {
-    // @ts-ignore (审计建议 #15: 错误处理)
-    window.api.getPinnedApps().then(apps => setState(s => ({ ...s, pinnedApps: apps }))).catch(console.error)
+    // @ts-ignore
+    window.api?.getPinnedApps()
+      .then(apps => setState(s => ({ ...s, pinnedApps: apps || [] })))
+      .catch(err => {
+        console.error('[UI] 加载固定应用失败:', err)
+        setState(s => ({ ...s, pinnedApps: [] }))
+      })
   }, [])
 
   useEffect(() => { 
     loadPinned()
     // @ts-ignore
-    window.api.getHotkey().then(h => setState(s => ({ ...s, hotkey: h })))
+    window.api?.getHotkey().then(h => setState(s => ({ ...s, hotkey: h || 'Alt+Q' }))).catch(() => {})
   }, [loadPinned])
 
-  // 搜索逻辑：防抖优化 (审计建议 #28)
+  // 搜索逻辑
   useEffect(() => {
     const delay = setTimeout(async () => {
       const q = state.query.trim()
@@ -47,6 +72,7 @@ export default function App() {
           const data = await window.api.search(q)
           setState(s => ({ ...s, results: data || [], loading: false, selectedIndex: 0 }))
         } catch (e) {
+          console.error('[UI] 搜索异常:', e)
           setState(s => ({ ...s, loading: false }))
         }
       } else {
@@ -56,7 +82,7 @@ export default function App() {
     return () => clearTimeout(delay)
   }, [state.query])
 
-  // 键盘导航 (审计建议 #8: 提取处理函数)
+  // 键盘导航
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     const { isRecording, showSettings, query, pinnedApps, results, selectedIndex } = stateRef.current
     
@@ -68,7 +94,6 @@ export default function App() {
       if (e.altKey) keys.push('Alt')
       if (e.metaKey) keys.push('Cmd')
       const key = e.key.toUpperCase()
-      // 审计建议 #30: includes
       if (!['CONTROL', 'SHIFT', 'ALT', 'META'].includes(key)) {
         keys.push(key === ' ' ? 'Space' : key)
         const newHotkey = keys.join('+')
@@ -84,33 +109,35 @@ export default function App() {
     if (showSettings) return
 
     const isGrid = !query
-    const maxIndex = isGrid ? 49 : results.length - 1
-    if (maxIndex < 0) return
+    const maxIndex = isGrid ? 49 : Math.max(0, results.length - 1)
 
     if (e.key === 'ArrowRight') setState(s => ({ ...s, selectedIndex: Math.min(s.selectedIndex + 1, maxIndex) }))
     if (e.key === 'ArrowLeft') setState(s => ({ ...s, selectedIndex: Math.max(s.selectedIndex - 1, 0) }))
     
-    // 审计建议 #26: 优化垂直导航
+    // --- 修复问题 30: 优化网格行导航 ---
     if (e.key === 'ArrowDown') {
       e.preventDefault()
-      setState(s => ({ ...s, selectedIndex: Math.min(s.selectedIndex + (isGrid ? 10 : 1), maxIndex) }))
+      const jump = isGrid ? 10 : 1
+      setState(s => ({ ...s, selectedIndex: Math.min(s.selectedIndex + jump, maxIndex) }))
     }
     if (e.key === 'ArrowUp') {
       e.preventDefault()
-      setState(s => ({ ...s, selectedIndex: Math.max(s.selectedIndex - (isGrid ? 10 : 1), 0) }))
+      const jump = isGrid ? 10 : 1
+      setState(s => ({ ...s, selectedIndex: Math.max(s.selectedIndex - jump, 0) }))
     }
     
     if (e.key === 'Enter') {
-      // 审计建议 #27: 边界检查
+      // --- 修复 TODO 10: 边界检查 ---
       if (isGrid) {
-        const pinned = pinnedApps.find(a => a.grid_index === selectedIndex)
+        const pinned = pinnedApps.find(a => a.grid_index === selectedIndex && a.grid_index >= 0)
         if (pinned) window.api.launch(pinned.path)
       } else if (results[selectedIndex]) {
         window.api.launch(results[selectedIndex].path)
       }
     }
-    if (e.key === 'Escape') { // @ts-ignore
-      window.api.hideWindow()
+    if (e.key === 'Escape') { 
+      // @ts-ignore
+      window.api?.hideWindow?.() 
     }
   }, [])
 
@@ -119,62 +146,66 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [handleKeyDown])
 
-  // 计算空位逻辑 (审计建议 #24: 提取复用)
-  const findFirstEmpty = (apps: any[]) => {
-    const indices = apps.map(a => a.grid_index)
-    let i = 0; while (indices.includes(i)) i++
-    return i
-  }
-
   const handleLaunch = (path: string) => { // @ts-ignore
     window.api.launch(path) }
   
+  // --- 修复 TODO 15: 返回值校验 ---
   const handlePin = async (e: any, item: any) => { 
     e.stopPropagation()
     const index = findFirstEmpty(state.pinnedApps)
-    // @ts-ignore
-    const newPinned = await window.api.pinApp(item, index)
-    setState(s => ({ ...s, pinnedApps: newPinned, query: '' }))
+    try {
+      // @ts-ignore
+      const newPinned = await window.api.pinApp(item, index)
+      if (newPinned) setState(s => ({ ...s, pinnedApps: newPinned, query: '' }))
+    } catch (err) { console.error('[UI] 固定失败:', err) }
   }
 
   const handleUnpin = async (e: any, path: string) => { 
-    e.stopPropagation(); // @ts-ignore
-    const newPinned = await window.api.unpinApp(path)
-    setState(s => ({ ...s, pinnedApps: newPinned }))
+    e.stopPropagation(); 
+    try {
+      // @ts-ignore
+      const newPinned = await window.api.unpinApp(path)
+      setState(s => ({ ...s, pinnedApps: newPinned || [] }))
+    } catch (e) { console.error(e) }
   }
 
   const handleReorder = async (path: string, newIndex: number) => {
-    // @ts-ignore
-    const newPinned = await window.api.updateAppPosition(path, newIndex)
-    setState(s => ({ ...s, pinnedApps: newPinned }))
+    try {
+      // @ts-ignore
+      const newPinned = await window.api.updateAppPosition(path, newIndex)
+      setState(s => ({ ...s, pinnedApps: newPinned || [] }))
+    } catch (e) { console.error(e) }
   }
 
   const handleAddFile = async () => { 
     setState(s => ({ ...s, showSettings: false }))
     // @ts-ignore
-    const file = await window.api.selectFile()
-    if (file) { 
-      const index = findFirstEmpty(state.pinnedApps)
-      // @ts-ignore
-      const newPinned = await window.api.pinApp(file, index)
-      setState(s => ({ ...s, pinnedApps: newPinned }))
-    } 
+    try {
+      const file = await window.api.selectFile()
+      if (file) { 
+        const index = findFirstEmpty(stateRef.current.pinnedApps)
+        // @ts-ignore
+        const newPinned = await window.api.pinApp(file, index)
+        setState(s => ({ ...s, pinnedApps: newPinned || [] }))
+      } 
+    } catch (e) { console.error(e) }
   }
 
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault(); e.stopPropagation(); setState(s => ({ ...s, isDraggingOver: false }))
     const paths = Array.from(e.dataTransfer.files).map(f => f.path)
     if (paths.length > 0) {
-      // @ts-ignore
-      const newItems = await window.api.processPaths(paths)
-      // 审计建议 #9: 优化批量固定逻辑
-      let currentApps = [...state.pinnedApps]
-      for (const item of newItems) {
-        const index = findFirstEmpty(currentApps)
+      try {
         // @ts-ignore
-        currentApps = await window.api.pinApp(item, index)
-      }
-      setState(s => ({ ...s, pinnedApps: currentApps }))
+        const newItems = await window.api.processPaths(paths)
+        let currentApps = [...stateRef.current.pinnedApps]
+        for (const item of newItems) {
+          const index = findFirstEmpty(currentApps)
+          // @ts-ignore
+          currentApps = await window.api.pinApp(item, index)
+        }
+        setState(s => ({ ...s, pinnedApps: currentApps }))
+      } catch (e) { console.error(e) }
     }
   }
 
@@ -191,14 +222,23 @@ export default function App() {
       <SearchBar query={state.query} setQuery={(q) => setState(s => ({ ...s, query: q }))} loading={state.loading} />
       <div className="flex-1 p-6 relative overflow-hidden">
         {!state.query ? (
-          <LaunchpadGrid pinnedApps={state.pinnedApps} selectedIndex={state.selectedIndex} onLaunch={handleLaunch} onUnpin={handleUnpin} onReorder={handleReorder} />
+          <div className="h-full overflow-y-auto custom-scrollbar pr-1">
+            {state.pinnedApps.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center text-slate-400 text-sm gap-4 pt-20">
+                <span>你的 Launchpad 是空的。</span>
+                <button onClick={handleAddFile} className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-all shadow-sm"><Plus className="w-4 h-4" />手动添加应用</button>
+              </div>
+            ) : (
+              <LaunchpadGrid pinnedApps={state.pinnedApps} selectedIndex={state.selectedIndex} onLaunch={handleLaunch} onUnpin={handleUnpin} onReorder={handleReorder} />
+            )}
+          </div>
         ) : (
           <SearchList results={state.results} selectedIndex={state.selectedIndex} onLaunch={handleLaunch} onPin={handlePin} />
         )}
       </div>
-      <div className="p-4 flex justify-between items-center bg-transparent border-t border-[#D6D6D6] relative">
+      <div className="p-4 flex justify-between items-center bg-transparent border-t border-[#D6D6D6] relative flex-shrink-0">
         <div className="flex gap-4 text-[10px] text-slate-400 font-bold uppercase tracking-widest">
-          <span><kbd className="bg-slate-100 px-1 py-0.5 rounded border border-slate-300 text-slate-600">{state.hotkey}</kbd> 唤起 / ESC 隐藏</span>
+          <span><kbd className="bg-slate-100 px-1 py-0.5 rounded border border-slate-300 text-slate-600 font-mono">{state.hotkey}</kbd> 唤起 / ESC 隐藏</span>
         </div>
         <div className="relative">
           {state.showSettings && (
